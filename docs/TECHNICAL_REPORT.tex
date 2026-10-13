@@ -1,0 +1,171 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\hypersetup{colorlinks=true,linkcolor=black,urlcolor=blue}
+\setlist{itemsep=2pt,topsep=3pt}
+\lstset{basicstyle=\ttfamily\small,breaklines=true,columns=fullflexible,frame=single,backgroundcolor=\color{black!3}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{Distributed P2P File Sharing System\\\large Technical Report}
+\author{Hritik Ranjan}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+The system is a hybrid peer-to-peer file sharing service. Two \emph{trackers} keep metadata (users,
+groups, file and piece hashes, who is seeding) and replicate it to each other. \emph{Clients} hash the
+files they share, serve pieces to other clients and download from several peers in parallel. File
+bytes never pass through, or are stored on, a tracker. Files are split into 512~KB pieces; every piece
+and the whole file carry a SHA-1 hash and every received piece is verified before it is written.
+
+\section{Implementation approach}
+Code is split by responsibility (table below). The tracker is a thread-per-connection server with one
+coarse mutex around the in-memory state; the client has a command-line thread, a peer-server thread per
+incoming connection, and a worker pool per download.
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}\toprule
+Module & Responsibility\\\midrule
+\code{tracker.cpp} & accept loop, per-connection thread, numeric status codes\\
+\code{user_manager.cpp} & users, sessions, groups, command dispatch\\
+\code{file_manager.cpp} & file metadata: upload, list, \code{file_info}, \code{add_seeder}, \code{stop_share}\\
+\code{store.cpp} & versioned, replicated state (cells, hybrid logical clock, merge)\\
+\code{sync_trackers.cpp} & tracker-to-tracker transport, heartbeat, reconnect, state exchange\\
+\code{client.cpp} & CLI, tracker connection, failover, local hashing for uploads\\
+\code{peer_server.cpp} & answers \code{GET_PIECE}; authorisation, bounds checks\\
+\code{downloader.cpp} & worker pool, peer selection, retry, \code{pwrite}, completion\\
+\code{net_util.h} & \code{sendAll}/\code{recvAll}/\code{LineReader}, framing, SHA-1 via OpenSSL EVP\\\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Protocol design and rationale}
+All communication uses TCP with text headers; payload bytes are binary.
+
+\paragraph{Client $\to$ tracker.} A request is one line. Commands that carry file names use TAB as the
+field separator, so names may contain spaces. A reply is a frame \code{<length> <status>\n<payload>}.
+Length-prefixing removes any guessing about where a reply ends (an earlier design relied on a read timeout and
+truncated long listings); the numeric status (200, 400, 401, 403, 404, 409; 416/500 in the peer protocol)
+lets programs react without parsing the text shown to the user.
+
+\paragraph{Client $\leftrightarrow$ client.} \code{GET_PIECE} over a persistent connection, answered by
+\code{PIECE_DATA <n>} followed by exactly $n$ bytes, or \code{ERROR <code> <reason>}. A persistent
+connection means a 1~GB download needs one connection per (worker, peer), not 2048 connections. The peer
+server asks its tracker whether the requester's (user, token) is a logged-in member of the group and
+checks the piece index against the real file size.
+
+\paragraph{Partial transmissions.} Every read and write goes through helpers that loop until the whole
+length is transferred; \code{LineReader} buffers per connection so several commands in one segment, or one
+command split over several segments, are both handled. \code{SIGPIPE} is ignored.
+
+\section{Synchronization algorithm}
+\paragraph{Problem.} If both trackers stay up but cannot reach each other, both keep serving clients.
+Copying one side's snapshot over the other on reconnect loses the other side's changes and revives deleted records.
+
+\paragraph{Design.} All state is a set of \emph{cells}: \code{key -> (stamp, present, value)}. Kinds:
+user, login, group, member, join request, file, seeder, shared-file. A deletion is a cell with
+\code{present=false} and its own stamp (a \emph{tombstone}). The \code{stamp} is a hybrid logical clock
+$(\text{wall ms},\text{counter},\text{tracker id})$ compared lexicographically \cite{hlc}: the clock never
+runs backwards, a change made after observing a remote change always gets a larger stamp even with clock
+skew, and the tracker id breaks ties deterministically. Merging is
+\[ \text{merge}(c_1,c_2)=\text{the cell with the larger stamp}, \]
+applied per key. It is commutative, associative and idempotent, so the cells form a state-based
+last-writer-wins element set \cite{crdt}; any delivery order or duplication converges.
+
+\paragraph{Protocol.} A local change is stamped, applied to the in-memory views (the \code{users}/\code{groups}
+maps that command handlers read) and queued; after the data mutex is released it is sent as one \code{CELL}
+line. Whenever a tracker's outgoing connection is (re)established it sends \emph{every} cell including
+tombstones and asks the peer to do the same. The heartbeat (3~s) is also the reconnect timer. This single
+mechanism provides (i) restart recovery (an empty tracker is refilled), and (ii) partition healing.
+
+\paragraph{Why it is correct for the tested cases.} During a cut, tracker~1 deleting a file stamps a tombstone
+$t_1$; tracker~2's older copy of the file has stamp $s<t_1$, so after exchange the tombstone wins on both
+sides. Independent additions (a group created on each side) touch different keys and both survive. A cell that
+arrives before its parent (a seeder before its file) is stored, and attached when the parent arrives, by a
+prefix scan of the ordered map.
+
+\paragraph{Deadlock avoidance.} Lock order is sync mutex $\to$ data mutex; the replication queue is flushed
+only after the data mutex is released; a snapshot request is answered on its own thread, so two trackers asking
+each other for state cannot block in \code{send()} at the same time.
+
+\paragraph{Sessions.} Login issues a random 128-bit token (replicated). After a tracker dies, the client reconnects
+to the other and calls \code{restore_session user token}. A dropped client connection is processed exactly like
+\code{logout} and replicated. A tracker \code{quit} does not log users out.
+
+\section{Piece selection strategy}
+Every seeder holds the complete file, so there is no piece rarity to exploit; rarest-first would degenerate
+to arbitrary order. The engine therefore uses \emph{round-robin load balancing}: piece $i$ is first requested
+from $\text{peers}[(i+\text{attempt}) \bmod n]$. Each live seeder serves an equal share and no piece is
+requested twice. A fixed pool of workers (default 8) pulls piece indices from a shared queue (mutex and
+condition variable). A piece that fails (connection error, wrong length, hash mismatch) is re-queued with that
+peer excluded and an attempt counter, up to 6 attempts; three consecutive failures mark a peer dead for the
+download. Verified pieces are written with \code{pwrite()} at \code{index * 512 KB}, so no file lock is needed.
+Completion is decided by counters (\code{completed + failed == total}), after which the whole file is verified,
+the client starts serving it and registers with the tracker (\code{add_seeder}). Several downloads may run at once.
+
+\section{Testing and results}
+\code{scripts/integration_test.py} starts real trackers and clients and checks 96 properties: file sizes from 0 bytes to
+80~MB and several file types; byte-exact downloads; load balance; retry when a seeder is killed mid-transfer;
+failure with no partial file when none is left; tracker crash, failover, restart catch-up; a \emph{network partition
+between two live trackers} (sync channel cut by a TCP proxy) with additions and deletions on both sides, then
+heal; glued and split protocol messages (including a 200~KB sync message in 1.5~KB pieces); authorisation,
+bounds, status codes. The suite also passes under ThreadSanitizer, AddressSanitizer+UBSan, and the macOS
+\code{leaks} tool reports 0 leaks in every live process afterwards.
+
+\paragraph{Benchmark} (\code{scripts/benchmark.py}; random 1~GB file, Apple M4, loopback, 8 workers; median of 3
+runs after a discarded warm-up).
+\begin{center}\small
+\begin{tabular}{@{}rrrrrr@{}}\toprule
+ & \multicolumn{2}{c}{Unthrottled} & \multicolumn{3}{c}{Seeder uplink emulated at 100~MB/s}\\\cmidrule(lr){2-3}\cmidrule(l){4-6}
+Seeders & Time & vs 1 & Time & MB/s & vs 1\\\midrule
+1 & 0.175 s & 1.00$\times$ & 10.248 s & 100 & 1.00$\times$\\
+2 & 0.181 s & 0.97$\times$ & 5.128 s & 200 & 2.00$\times$\\
+4 & 0.185 s & 0.95$\times$ & 2.572 s & 398 & 3.98$\times$\\\bottomrule
+\end{tabular}
+\end{center}
+Unthrottled, the downloader's CPU (SHA-1 of every piece, memory copies) is the bottleneck, so extra seeders do
+not help. The right-hand columns come from a token bucket in the peer server (\code{P2P_UPLOAD_KBPS}); they show
+that the engine keeps every seeder saturated and splits work evenly, not a real network measurement.
+
+\section{Challenges and solutions}
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[Knowing when a download is finished.] Inferring failure from ``no active threads'' fired before workers had
+started. Solution: count pieces completed/failed under one mutex.
+\item[Partial reads and writes.] A single \code{read()} is not a message. Solution: \code{sendAll}/\code{recvAll},
+buffered \code{LineReader}, length-prefixed replies.
+\item[Failover without split state.] A dropped connection and an explicit logout used to differ, so the two
+trackers disagreed. Solution: one code path for both, replicated; session token for \code{restore_session}.
+\item[Partitions between live trackers.] See section~4; solved with versioned cells and tombstones, and tested
+with a TCP proxy that cuts the sync channel.
+\item[Lock ordering and network I/O.] Sending while holding the data mutex risked stalls and deadlocks. Solution:
+queue messages under the lock, flush after release; one documented lock order.
+\item[Automatic seeding.] The tracker listing a downloader as seeder is useless unless its peer server can serve
+the file. Solution: downloads register the file locally first, then tell the tracker; failed uploads register nothing.
+\item[Memory limits.] A 512~KB array on a thread stack can overflow secondary-thread stacks. Solution: heap buffers.
+\item[Honest performance numbers.] Loopback hides what multi-source download is for. Solution: report the
+unthrottled result as measured and the capped one explicitly as emulation.
+\end{description}
+
+\section{Limitations}
+Two trackers only; concurrent conflicting edits to one record during a partition resolve by latest stamp;
+tombstones are not garbage-collected; no TLS (passwords are hashed at rest and in replication but sent in clear
+between client and tracker); a client's list of files it serves is in memory (re-attach with \code{become_seeder}
+after a restart); no per-peer piece bitmaps, so only complete files are seeded; developed and tested on macOS.
+
+\begin{thebibliography}{9}
+\bibitem{bep3} B.~Cohen, \emph{The BitTorrent Protocol Specification} (BEP~3), \url{https://www.bittorrent.org/beps/bep_0003.html} -- background on trackers, pieces and per-piece hashing.
+\bibitem{hlc} S.~Kulkarni, M.~Demirbas, D.~Madappa, B.~Avva, M.~Leone, \emph{Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases}, 2014 -- hybrid logical clock.
+\bibitem{lamport} L.~Lamport, \emph{Time, Clocks, and the Ordering of Events in a Distributed System}, CACM 21(7), 1978.
+\bibitem{crdt} M.~Shapiro, N.~Pregui\c{c}a, C.~Baquero, M.~Zawirski, \emph{A comprehensive study of Convergent and Commutative Replicated Data Types}, INRIA RR-7506, 2011 -- LWW-element-set.
+\bibitem{rfc3174} D.~Eastlake, P.~Jones, \emph{US Secure Hash Algorithm 1 (SHA1)}, RFC~3174.
+\bibitem{posix} POSIX.1-2017 (\code{socket}, \code{poll}, \code{pread}/\code{pwrite}, \code{pthread}) and the OpenSSL \code{EVP_Digest*} manual pages.
+\end{thebibliography}
+\end{document}

@@ -1,0 +1,28 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssl-dev libreadline-dev python3
+      - name: Shared headers are identical in tracker/ and client/
+        run: |
+          diff tracker/net_util.h client/net_util.h
+          diff tracker/tracker_info.h client/tracker_info.h
+      - name: Build with g++ (warnings are errors)
+        run: |
+          make -C tracker CXX=g++ CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 -pthread"
+          make -C client  CXX=g++ CXXFLAGS="-std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 -pthread"
+      - name: Integration tests
+        run: python3 scripts/integration_test.py
+      - name: Build sanitizer variants
+        run: |
+          make -C tracker asan debug
+          make -C client asan debug
+      - name: Integration tests under AddressSanitizer/UBSan
+        run: P2P_TRACKER_BIN=$PWD/tracker/tracker-asan P2P_CLIENT_BIN=$PWD/client/client-asan python3 scripts/integration_test.py
+      - name: Integration tests under ThreadSanitizer
+        run: P2P_TRACKER_BIN=$PWD/tracker/tracker-debug P2P_CLIENT_BIN=$PWD/client/client-debug python3 scripts/integration_test.py

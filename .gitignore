@@ -1,0 +1,26 @@
+# build output
+*.o
+*.dSYM/
+tracker/tracker
+tracker/tracker-debug
+tracker/tracker-asan
+tracker/*.dSYM/
+client/client
+client/client-debug
+client/client-asan
+client/*.dSYM/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# python
+__pycache__/
+*.pyc
+
+# latex
+*.aux
+*.log
+*.out
+*.toc
